@@ -4,7 +4,6 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const readline = require('readline');
 const { execFile } = require('child_process');
 const { duration, tokens } = require('./shared');
 
@@ -26,46 +25,89 @@ const add = (into, from) => { for (const [k, v] of Object.entries(from)) into[k]
 
 // Aggregates one transcript. Assistant messages are written once per content block with the
 // same message id and usage, so usage is deduplicated by id.
-async function parseFile(file) {
-  const seen = new Set(), hours = {}, tools = {}, models = {};
-  let cwd = null, peakCtx = 0, firstCtx = null, turns = 0;
-  const rl = readline.createInterface({ input: fs.createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line.includes('"assistant"')) {
-      if (cwd === null && line.includes('"cwd"')) {
-        const m = line.match(/"cwd":"((?:[^"\\]|\\.)*)"/);
-        if (m) try { cwd = JSON.parse(`"${m[1]}"`); } catch { /* malformed escape: try the next line */ }
-      }
-      continue;
+//
+// Transcripts only ever grow, so a file that got longer is read from where the last scan stopped
+// (`off`) instead of from the start: busy sessions reach tens of MB, and re-reading all of them
+// every minute kept a core busy on a loaded laptop. `tail` keeps the last few message ids, enough
+// to deduplicate blocks that straddle the point where reading resumes.
+const TAIL_IDS = 8, CHUNK = 1 << 20;
+
+const freshAgg = () => ({ cwd: null, hours: {}, tools: {}, models: {}, peakCtx: 0, firstCtx: null, turns: 0, off: 0, tail: [] });
+
+function feed(agg, line, seen, ids) {
+  if (!line.includes('"assistant"')) {
+    if (agg.cwd === null && line.includes('"cwd"')) {
+      const m = line.match(/"cwd":"((?:[^"\\]|\\.)*)"/);
+      if (m) try { agg.cwd = JSON.parse(`"${m[1]}"`); } catch { /* malformed escape: try the next line */ }
     }
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
-    const msg = d.message || {};
-    cwd = cwd || d.cwd || null;
-    for (const c of Array.isArray(msg.content) ? msg.content : []) {
-      if (c && c.type === 'tool_use') tools[c.name || '?'] = (tools[c.name || '?'] || 0) + 1;
-    }
-    const u = msg.usage;
-    if (!u || seen.has(msg.id) || msg.model === '<synthetic>') continue;
-    seen.add(msg.id);
-    const cw1h = (u.cache_creation || {}).ephemeral_1h_input_tokens || 0;
-    const cw = u.cache_creation_input_tokens || 0;
-    const t = { in: u.input_tokens || 0, cw5: cw - cw1h, cw1h, cr: u.cache_read_input_tokens || 0, out: u.output_tokens || 0 };
-    const ctx = t.in + cw + t.cr;
-    peakCtx = Math.max(peakCtx, ctx);
-    if (firstCtx === null) firstCtx = ctx;
-    turns++;
-    const model = msg.model || '?';
-    const w = weigh(t, model);
-    models[model] = (models[model] || 0) + w;
-    const h = (hours[(d.timestamp || '').slice(0, 13)] ||= [0, 0, 0, 0, 0, 0]);
-    KEYS.forEach((k, i) => { h[i] += t[k]; });
-    h[5] += w;
+    return;
   }
-  return { cwd, hours, tools, models, peakCtx, firstCtx, turns };
+  let d;
+  try { d = JSON.parse(line); } catch { return; }
+  const msg = d.message || {};
+  agg.cwd = agg.cwd || d.cwd || null;
+  for (const c of Array.isArray(msg.content) ? msg.content : []) {
+    if (c && c.type === 'tool_use') agg.tools[c.name || '?'] = (agg.tools[c.name || '?'] || 0) + 1;
+  }
+  const u = msg.usage;
+  if (!u || seen.has(msg.id) || msg.model === '<synthetic>') return;
+  seen.add(msg.id);
+  ids.push(msg.id);
+  const cw1h = (u.cache_creation || {}).ephemeral_1h_input_tokens || 0;
+  const cw = u.cache_creation_input_tokens || 0;
+  const t = { in: u.input_tokens || 0, cw5: cw - cw1h, cw1h, cr: u.cache_read_input_tokens || 0, out: u.output_tokens || 0 };
+  const ctx = t.in + cw + t.cr;
+  agg.peakCtx = Math.max(agg.peakCtx, ctx);
+  if (agg.firstCtx === null) agg.firstCtx = ctx;
+  agg.turns++;
+  const model = msg.model || '?';
+  const w = weigh(t, model);
+  agg.models[model] = (agg.models[model] || 0) + w;
+  const h = (agg.hours[(d.timestamp || '').slice(0, 13)] ||= [0, 0, 0, 0, 0, 0]);
+  KEYS.forEach((k, i) => { h[i] += t[k]; });
+  h[5] += w;
 }
 
-// Re-parses only transcripts whose size or mtime changed since the cached scan.
+// prev: the cached aggregate to continue from (its `off` must be within the file), or none.
+async function parseFile(file, prev) {
+  const agg = prev && prev.off >= 0 ? structuredClone(prev) : freshAgg();
+  if (!Array.isArray(agg.tail)) agg.tail = [];
+  const seen = new Set(agg.tail), ids = agg.tail.slice();
+  const fh = await fs.promises.open(file, 'r');
+  try {
+    const size = (await fh.stat()).size;
+    const buf = Buffer.allocUnsafe(CHUNK);
+    let pos = agg.off, rest = null;
+    while (pos < size) {
+      const { bytesRead } = await fh.read(buf, 0, Math.min(CHUNK, size - pos), pos);
+      if (!bytesRead) break;
+      pos += bytesRead;
+      const chunk = rest ? Buffer.concat([rest, buf.subarray(0, bytesRead)]) : buf.subarray(0, bytesRead);
+      let start = 0, nl;
+      while ((nl = chunk.indexOf(10, start)) !== -1) {
+        feed(agg, chunk.toString('utf8', start, nl), seen, ids);
+        start = nl + 1;
+      }
+      rest = start < chunk.length ? Buffer.from(chunk.subarray(start)) : null;
+      agg.off = pos - (rest ? rest.length : 0);
+    }
+    // A last line without a newline counts only once it is complete JSON; a half-written one is
+    // read again next time.
+    if (rest) {
+      const line = rest.toString('utf8');
+      let complete = true;
+      try { JSON.parse(line); } catch { complete = false; }
+      if (complete) { feed(agg, line, seen, ids); agg.off += rest.length; }
+    }
+  } finally {
+    await fh.close();
+  }
+  agg.tail = ids.slice(-TAIL_IDS);
+  return agg;
+}
+
+// Re-parses only transcripts whose size or mtime changed since the cached scan; ones that only
+// grew are read from where the last scan stopped.
 async function scan(cache, root = PROJECTS) {
   let files;
   try { files = fs.readdirSync(root, { recursive: true }).filter(f => f.endsWith('.jsonl')); } catch { return {}; }
@@ -76,8 +118,9 @@ async function scan(cache, root = PROJECTS) {
     try { st = fs.statSync(file); } catch { continue; }
     const old = cache[file];
     if (old && old.sig[0] === st.size && old.sig[1] === st.mtimeMs) { out[file] = old; continue; }
+    const grew = old && typeof old.off === 'number' && st.size > old.sig[0] && old.off <= st.size;
     let agg;
-    try { agg = await parseFile(file); } catch { continue; }
+    try { agg = await parseFile(file, grew ? old : null); } catch { continue; }
     const parts = rel.split(/[\\/]/);
     out[file] = Object.assign(agg, {
       sig: [st.size, st.mtimeMs], mtime: st.mtimeMs, projdir: parts[0],

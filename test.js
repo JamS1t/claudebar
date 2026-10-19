@@ -61,6 +61,29 @@ const { Spring, tokens, duration, lerpRect, inside, esc } = require('./shared');
   assert.equal(Object.keys(cache).length, 2);
   const first = Object.keys(cache)[0];
   assert.equal((await data.scan(cache, dir))[first], cache[first], 'unchanged files come from cache');
+  // a growing transcript is read from where the last scan stopped, and matches a full parse;
+  // a half-written last line waits for the next scan, and blocks straddling the resume point
+  // are not counted twice
+  const grow = path.join(proj, 'sess2.jsonl');
+  fs.writeFileSync(grow, `${msg('g1', 'Read')}\n${msg('g2', 'Grep')}\n`);
+  let inc = await data.scan({}, dir);
+  assert.equal(inc[grow].off, fs.statSync(grow).size);
+  const half = msg('g3', 'Edit');
+  fs.appendFileSync(grow, `${msg('g2', 'Bash')}\n${half.slice(0, 40)}`);
+  inc = await data.scan(inc, dir);
+  assert.equal(inc[grow].turns, 2, 'repeated id and half line not counted');
+  fs.appendFileSync(grow, `${half.slice(40)}\n${msg('g4', 'Read')}`);
+  inc = await data.scan(inc, dir);
+  const full = await data.parseFile(grow);
+  for (const k of ['turns', 'tools', 'hours', 'models', 'peakCtx', 'firstCtx', 'cwd']) assert.deepEqual(inc[grow][k], full[k], k);
+  assert.equal(inc[grow].turns, 4);
+  assert.deepEqual(inc[grow].tools, { Read: 2, Grep: 1, Bash: 1, Edit: 1 });
+  // a file that shrank (rewritten) is parsed from scratch
+  fs.writeFileSync(grow, msg('r1', 'Read'));
+  inc = await data.scan(inc, dir);
+  assert.equal(inc[grow].turns, 1);
+  fs.rmSync(grow);
+
   const s = data.summarize(cache);
   assert.equal(s.proj[0][0], 'demo');
   assert.equal(s.live.length, 1, 'subagent transcripts are not sessions');

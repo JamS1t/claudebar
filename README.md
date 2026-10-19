@@ -9,9 +9,19 @@ An always-on, liquid-glass dock on the right edge of your Windows screen that ke
 - **Chevron**: hover or click to open the details panel with four tabs: Overview, Projects, Insights, Plugins.
 - **Projects launcher**: hover or click to open a searchable list of folders you've used Claude Code in. Click a row (or press Enter on the top match) to run `claude --continue` there in Windows Terminal, or a plain console if Windows Terminal isn't installed.
 - Hovering another dock control while a panel is open morphs the panel into that control's surface. Moving the pointer away closes it.
-- **Drag** the dock up or down the edge (the position is remembered). **Right-click** it to refresh or quit.
+- **Drag** the dock up or down the edge (the position is remembered). **Right-click** it to refresh, turn Start at Login on or off, reload the dock, or quit.
 
 The glass is real: the window is excluded from screen capture, so the app streams what is behind it and draws refracting, frosted glass over it with a WebGL shader. Light backdrops switch the glass to dark text.
+
+## Staying light and reliable
+
+The dock is built to sit on screen all day next to heavy work:
+
+- The screen is captured at the blur's own resolution (half the screen size, 30 fps max). While nothing moves and the pointer is away, the glass redraws only 10 times a second, and only the area around the dock is drawn.
+- Picking light or dark glass never makes the page wait on a busy GPU.
+- Transcripts that grow are read from where the last scan stopped, not from the start, and the cache is only saved when something changed.
+- The screen capture restarts by itself after sleep, lock, display changes or a stall. A lost GPU context is rebuilt, and a crashed or hung page is reloaded. Without WebGL the dock falls back to plain dark surfaces instead of going blank.
+- Caches are written through a temporary file, so a shutdown mid-write can't corrupt them.
 
 ## What the panel shows
 
@@ -53,7 +63,7 @@ npx electron . --snap=shots          # add --white or --split to test light and 
 
 ### Start at login
 
-Create a shortcut in `shell:startup` pointing to `node_modules\electron\dist\electron.exe` with the project folder as its argument.
+Right-click the dock and tick **Start at Login**.
 
 ## Legacy version
 
