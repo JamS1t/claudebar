@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('bridge', {
   onState: fn => ipcRenderer.on('state', (_, v) => fn(v)),
   onCursor: fn => ipcRenderer.on('cursor', (_, v) => fn(v)),
   onGeometry: fn => ipcRenderer.on('geometry', (_, v) => fn(v)),
+  onRecapture: fn => ipcRenderer.on('recapture', () => fn()),
   geometry: () => ipcRenderer.invoke('geometry'),
   captureSource: () => ipcRenderer.invoke('capture-source'),
   setIgnore: ignore => ipcRenderer.send('ignore', ignore),

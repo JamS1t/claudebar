@@ -197,3 +197,9 @@ html, body {
 .empty { padding: 14px; font-size: 12px; color: var(--secondary); }
 .error { color: #FF6961; }
 .light .error { color: #D70015; }
+
+/* No WebGL (GPU blocked or lost): plain dark surfaces instead of glass, so the dock stays usable. */
+.noglass #glass { visibility: hidden; }
+.noglass #dock, .noglass #fly, .noglass #panel, .noglass #projects { background: rgba(30, 30, 32, .94); }
+.noglass #dock { border-radius: 31px 0 0 31px; }
+.noglass #fly { border-radius: 24px; }

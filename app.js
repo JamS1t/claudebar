@@ -11,6 +11,7 @@
   const DOCK_W = 62, DOCK_H = 264, FLY_W = 248, FLY_H = 88, PANEL_W = 368, PANEL_MAX_H = 600, PROJ_W = 320, PROJ_MAX_H = 460;
   const PANEL_GAP = 14, FLY_GAP = 12, RING_Y = { session: 34, weekly: 102 }, LAUNCH_Y = 170, EXPAND_Y = 232;
   const OPEN_DELAY = 90, CLOSE_DELAY = 260, FLY_DELAY = 50, FLY_HIDE = 140, SWAP_DELAY = 120;
+  const MAX_ROWS = 60; // launcher rows drawn at once
 
   const RING = { session: ['#FFB340', '#FF6A3D'], weekly: ['#64D2FF', '#0A84FF'], critical: ['#FF8A80', '#FF453A'] };
   const SEV = { good: '#30D158', ok: '#0A84FF', warn: '#FF9F0A', high: '#FF453A' };
@@ -60,12 +61,26 @@
 
   // ---------- glass + frame loop ----------
   const glass = new window.Glass($('glass'));
-  let raf = 0, last = 0;
+  // without WebGL the surfaces get a plain tinted background from CSS
+  glass.onStatus = ok => { document.body.classList.toggle('noglass', !ok); kick(); };
+  document.body.classList.toggle('noglass', !glass.ok);
+  let raf = 0, last = 0, lastDraw = 0, idleTimer = 0;
   const kick = () => { if (!raf) raf = requestAnimationFrame(frame); };
-  glass.onFrame = kick;
+  // While nothing moves and the pointer is away, the backdrop only needs a few redraws a second.
+  // Redrawing at full capture rate kept the GPU busy all day and starved clicks on a loaded machine.
+  const IDLE_FRAME = 1000 / 10;
+  const awake = () => !!(state.zone || state.panel || state.fly || state.drag) ||
+    Object.values(springs).some(s => s.moving);
+  glass.onFrame = () => {
+    if (raf || idleTimer) return;
+    const wait = IDLE_FRAME - (performance.now() - lastDraw);
+    if (wait <= 0 || awake()) kick();
+    else idleTimer = setTimeout(() => { idleTimer = 0; kick(); }, wait);
+  };
 
   function frame(now) {
     raf = 0;
+    lastDraw = performance.now();
     const dt = last ? Math.min((now - last) / 1000, 1 / 30) : 1 / 60;
     last = now;
     let moving = false;
@@ -89,13 +104,13 @@
     if (state.flyKind && F > 0.002) {
       const f = clamp(F, 0, 1);
       flyRect = lerpRect(state.flyFrom || ringRect(state.flyKind), flyTarget(), F);
-      fly = { rect: flyRect, radius: lerp(20, 24, f), exp: lerp(2, 4, f), merge: 28 * (1 - f), theme: springs.tFly.value, frost: 1, shadow: 0.24 * f, tint: 0.17 };
+      fly = { rect: flyRect, radius: lerp(20, 24, f), exp: lerp(2, 4, f), merge: 28 * (1 - f), theme: springs.tFly.value, frost: 1, shadow: 0.24 * f, tint: 0.17, sample: flyTarget() };
     }
     let panel = null, panelRect = null;
     if (P > 0.002) {
       const p = clamp(P, 0, 1);
       panelRect = lerpRect(state.panelFrom || panelOrigin(), panelTarget(), P);
-      panel = { rect: panelRect, radius: lerp(14, 30, p), exp: lerp(2, 4, p), merge: 36 * (1 - p), theme: springs.tPanel.value, frost: 1, shadow: 0.3 * p, tint: 0.2 };
+      panel = { rect: panelRect, radius: lerp(14, 30, p), exp: lerp(2, 4, p), merge: 36 * (1 - p), theme: springs.tPanel.value, frost: 1, shadow: 0.3 * p, tint: 0.2, sample: panelTarget() };
     }
     state.lastFly = flyRect;
     state.lastPanel = panelRect;
@@ -132,6 +147,8 @@
     const c = el._css || (el._css = {});
     if (c[k] !== v) { c[k] = v; el.style[k] = v; }
   }
+  function text(el, v) { if (el.textContent !== v) el.textContent = v; }
+  function setHtml(el, v) { if (el._html !== v) { el._html = v; el.innerHTML = v; } }
 
   function ink(el, t) {
     const v = Math.round(255 * (1 - t));
@@ -141,11 +158,26 @@
     el.classList.toggle('light', t > 0.5);
   }
 
-  // Light backdrop -> light glass with dark text, and back, with hysteresis.
+  // Light backdrop -> light glass with dark text, and back, with hysteresis. A surface that just
+  // appeared asks for a reading of its own backdrop at once and snaps to it, instead of fading
+  // over from the appearance it had wherever it was last open.
+  const themeGen = [0, 0, 0], themeFirst = [false, true, true];
   function themeFromBackdrop() {
+    const shown = [true, !!state.lastFly, !!state.lastPanel];
     ['tDock', 'tFly', 'tPanel'].forEach((k, i) => {
-      const l = glass.luma[i], s = springs[k];
-      if (l > 0.62 && s.target === 0) { s.set(1); kick(); }
+      const s = springs[k];
+      if (!shown[i]) { themeFirst[i] = true; return; }
+      if (themeFirst[i] === true) {
+        themeFirst[i] = 'waiting';
+        themeGen[i] = glass.lumaGen[i];
+        glass.sampleSoon();
+        if (s.target !== springs.tDock.target) s.snap(springs.tDock.target); // until it has one
+      }
+      if (glass.lumaGen[i] === themeGen[i]) return; // no new reading yet
+      themeGen[i] = glass.lumaGen[i];
+      const l = glass.luma[i];
+      if (themeFirst[i]) { themeFirst[i] = false; s.snap(l > 0.54 ? 1 : 0); kick(); }
+      else if (l > 0.62 && s.target === 0) { s.set(1); kick(); }
       else if (l < 0.46 && s.target === 1) { s.set(0); kick(); }
     });
   }
@@ -413,17 +445,22 @@
   function renderPanel(animate) {
     const vm = state.vm;
     if (!vm) return;
-    $('plan').textContent = vm.plan || '';
-    $('updated').textContent = `Updated ${new Date(vm.updated).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
-    const content = $('content');
-    const scroll = content.scrollTop;
-    content.innerHTML = TABS[state.tab](vm);
-    content.scrollTop = scroll;
+    text($('plan'), vm.plan || '');
+    text($('updated'), `Updated ${new Date(vm.updated).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`);
     document.querySelectorAll('#seg button').forEach((b, i) => {
       b.classList.toggle('on', i === state.tab);
       b.setAttribute('aria-selected', String(i === state.tab));
     });
-    $('thumb').style.transform = `translateX(${state.tab * 100}%)`;
+    css($('thumb'), 'transform', `translateX(${state.tab * 100}%)`);
+    const content = $('content');
+    const html = TABS[state.tab](vm);
+    // Unchanged content is left alone: replacing it on every refresh repainted the panel and could
+    // swallow a click whose target was swapped out between press and release.
+    if (!animate && content._html === html) return;
+    content._html = html;
+    const scroll = content.scrollTop;
+    content.innerHTML = html;
+    content.scrollTop = scroll;
     const arcs = content.querySelectorAll('.arc[data-offset]');
     const apply = () => arcs.forEach(a => { a.style.strokeDashoffset = a.dataset.offset; });
     if (animate && !REDUCED) requestAnimationFrame(() => requestAnimationFrame(apply));
@@ -443,16 +480,20 @@
   function renderProjects() {
     const vm = state.vm, list = $('proj-list');
     const all = (vm && vm.recent) || [];
-    $('proj-count').textContent = all.length ? `${all.length} folders` : '';
-    if (!vm || vm.scanning) { list.innerHTML = empty('Scanning transcripts…'); return; }
+    text($('proj-count'), all.length ? `${all.length} folders` : '');
+    if (!vm || vm.scanning) { setHtml(list, empty('Scanning transcripts…')); return; }
     const q = $('q').value, found = matches();
-    if (!found.length) { list.innerHTML = empty(q ? 'No project matches.' : 'No projects yet.'); return; }
-    list.innerHTML = section(q ? 'Matches' : 'Recent', 'Resume in terminal') + `<div class="group">${found.map((r, i) =>
+    if (!found.length) { setHtml(list, empty(q ? 'No project matches.' : 'No projects yet.')); return; }
+    // Long histories (worktrees, temp folders) reach thousands of folders; drawing them all made
+    // opening the launcher stall. Search still covers every folder.
+    const shown = found.slice(0, MAX_ROWS);
+    setHtml(list, section(q ? 'Matches' : 'Recent', 'Resume in terminal') + `<div class="group">${shown.map((r, i) =>
       `<div class="row action${i === 0 && q ? ' first' : ''}" style="--inset:54px" data-cwd="${esc(r.cwd)}" title="${esc(r.cwd)}">` +
       `<span class="tile" style="background:#30B0C7">${svg('terminal')}</span><div class="row-main">` +
       `<div class="row-line"><span class="row-title strong">${esc(r.name)}</span>` +
       `<span class="row-detail">${esc(ago(r.mtime))}</span></div><div class="row-sub path">${esc(r.cwd)}</div></div>` +
-      `<span class="go">${svg('chevron')}</span></div>`).join('')}</div>`;
+      `<span class="go">${svg('chevron')}</span></div>`).join('')}</div>` +
+      (found.length > shown.length ? `<p class="foot">${found.length - shown.length} older folders. Search to find them.</p>` : ''));
   }
 
   function launch(cwd, el) {
@@ -518,6 +559,11 @@
       setPanel(state.clickedShut ? false : mode);
     }
   });
+  // A press whose release never arrives (focus stolen, the system took the pointer) must not leave
+  // a drag behind: while one is set, hover and clicks are ignored and the dock seems frozen.
+  const dropDrag = () => { state.drag = null; };
+  dockEl.addEventListener('pointercancel', dropDrag);
+  dockEl.addEventListener('lostpointercapture', () => setTimeout(dropDrag, 0)); // after pointerup
   dockEl.addEventListener('contextmenu', e => { e.preventDefault(); bridge.menu(); });
   addEventListener('mousemove', e => onPointer({ x: e.clientX, y: e.clientY }));
 
@@ -530,19 +576,66 @@
   }
   addEventListener('resize', resize);
 
+  // ---------- screen capture ----------
+  // The capture stream dies on sleep, lock, display changes and GPU resets, and can fail outright
+  // right after login. A dead stream used to leave the glass frozen on its last frame (and stuck on
+  // whatever appearance that frame gave it), so it is restarted whenever it ends or goes quiet.
+  const STALL_MS = 10e3;
+  let capGen = 0, capStream = null, capRetry = 0, capFails = 0, capStartedAt = 0;
+
+  function stopCapture() {
+    capGen++;
+    clearTimeout(capRetry);
+    capRetry = 0;
+    glass.detachVideo();
+    if (capStream) capStream.getTracks().forEach(t => t.stop());
+    capStream = null;
+    $('capture').srcObject = null;
+  }
+
+  function retryCapture(ms) {
+    clearTimeout(capRetry);
+    capRetry = setTimeout(() => { capRetry = 0; startCapture(); }, ms);
+  }
+
   async function startCapture() {
+    stopCapture();
+    const gen = capGen;
     try {
       const src = await bridge.captureSource();
+      if (!src) throw new Error('no screen to capture yet');
+      // Half the screen's css size is the blur buffer's resolution, so nothing visible is lost,
+      // and a quarter of the pixels to copy and upload compared with full resolution.
       const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { mandatory: {
-        chromeMediaSource: 'desktop', chromeMediaSourceId: src.id, maxWidth: src.width, maxHeight: src.height, maxFrameRate: 60 } } });
+        chromeMediaSource: 'desktop', chromeMediaSourceId: src.id, maxWidth: src.width, maxHeight: src.height, maxFrameRate: 30 } } });
+      if (gen !== capGen) { stream.getTracks().forEach(t => t.stop()); return; }
+      capStream = stream;
+      stream.getVideoTracks().forEach(t => t.addEventListener('ended', () => { if (gen === capGen) retryCapture(1000); }));
       const video = $('capture');
       video.srcObject = stream;
       await video.play();
+      if (gen !== capGen) return;
+      capStartedAt = performance.now();
+      capFails = 0;
       glass.attachVideo(video);
     } catch (e) {
-      console.error('Screen capture failed; glass falls back to a solid tint.', e);
+      if (gen !== capGen) return;
+      capFails++;
+      console.error('Screen capture failed; retrying. The glass shows a solid tint meanwhile.', e);
+      retryCapture(Math.min(60e3, 1000 * 2 ** capFails));
     }
   }
+
+  // No frames for a while: restart, waiting longer after each restart that didn't help (a screen
+  // that never changes may simply produce no frames). A stream still delivering well after it
+  // started counts as healthy again.
+  let capStalls = 0;
+  setInterval(() => {
+    if (!capStream || capRetry) return;
+    if (glass.lastFrameAt - capStartedAt > 3 * STALL_MS) capStalls = 0;
+    const lastFrame = Math.max(glass.lastFrameAt, capStartedAt);
+    if (performance.now() - lastFrame > STALL_MS * 2 ** Math.min(capStalls, 4)) { capStalls++; startCapture(); }
+  }, 5000);
 
   // Scripted states for --snap screenshots.
   window.__dock = {
@@ -566,6 +659,8 @@
   bridge.onGeometry(g => { glass.setGeometry(g); resize(); });
   bridge.onState(vm => { state.vm = vm; update(); });
   bridge.onCursor(p => onPointer(p));
+  // wake from sleep, unlock, display changes: the old stream is dead or shows the wrong screen
+  bridge.onRecapture(() => { capFails = 0; capStalls = 0; startCapture(); });
   setInterval(update, 15000); // countdowns
   startCapture();
   bridge.ready();

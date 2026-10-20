@@ -1,8 +1,9 @@
 // Liquid glass compositor. One full-window WebGL2 canvas draws every glass surface from a live
 // capture of the screen behind the window (the window is excluded from that capture).
 //
-// Per frame:
-//   1. copy the window's region of the screen into a half-resolution buffer
+// Per frame (every pass is scissored to the area around the surfaces):
+//   1. copy the window's region of the screen into a half-resolution buffer, only when a new
+//      screen frame arrived or the surfaces grew past the area blurred last time
 //   2. blur it with four widening separable Gaussian passes (frosted variant)
 //   3. shade each pixel against the signed distance field of all shapes, merged with a smooth
 //      minimum so nearby shapes flow into each other like liquid. Inside: refraction that bends
@@ -115,7 +116,8 @@ void main() {
   float t = clamp(1.0 - depth / 20.0, 0.0, 1.0);
   float bend = 14.0 * pow(t, 2.4);
   vec2 q = p - n * bend;
-  vec3 col = mix(screenAt(q), blurAt(q), look.y);
+  // fully frosted surfaces skip the screen fetch
+  vec3 col = look.y > 0.999 ? blurAt(q) : mix(screenAt(q), blurAt(q), look.y);
   if (uHas < 0.5) col = vec3(0.14);
 
   // Vibrancy, then tint toward black (dark appearance) or white (light appearance); the bezel
@@ -196,93 +198,180 @@ void main() {
     return { tex, fb, w, h };
   }
 
+  // css px box helpers: { x0, y0, x1, y1 }
+  const grow = (b, m) => ({ x0: b.x0 - m, y0: b.y0 - m, x1: b.x1 + m, y1: b.y1 + m });
+  const contains = (o, b) => !!o && b.x0 >= o.x0 && b.y0 >= o.y0 && b.x1 <= o.x1 && b.y1 <= o.y1;
+
+  const LUMA_EVERY = 250; // ms between backdrop brightness samples
+
   class Glass {
+    // Never throws: without WebGL2 (GPU blocklisted or crashed too often) `ok` stays false, every
+    // call is a no-op and the page shows plain tinted surfaces instead (see onStatus).
     constructor(canvas) {
-      const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false });
-      if (!gl) throw new Error('WebGL2 unavailable');
-      this.gl = gl;
       this.canvas = canvas;
-      this.copy = program(gl, COPY_FS);
-      this.blur = program(gl, BLUR_FS);
-      this.glass = program(gl, GLASS_FS);
-      this.screen = texture(gl);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
-      gl.bindVertexArray(gl.createVertexArray());
       this.has = 0;
       this.map = [0, 0, 1, 1];
       this.luma = [0, 0, 0];
+      this.lumaGen = [0, 0, 0]; // bumped per new reading of each surface
       this.lumaAt = 0;
+      this.lastFrameAt = 0; // performance.now() of the newest screen frame
       this.onFrame = null;
+      this.onStatus = null; // (ok) => void
+      this.ok = false;
+      this.gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false });
+      if (!this.gl) return;
+      // A busy or crashed GPU process takes the context away; get it back instead of freezing on
+      // the last frame.
+      canvas.addEventListener('webglcontextlost', e => {
+        e.preventDefault();
+        this.ok = false;
+        this.pending = null;
+        if (this.onStatus) this.onStatus(false);
+      });
+      canvas.addEventListener('webglcontextrestored', () => {
+        this.init();
+        if (this.ok && this.cssW) this.resize(this.cssW, this.cssH, this.dpr);
+        if (this.onStatus) this.onStatus(this.ok);
+        if (this.onFrame) this.onFrame();
+      });
+      this.init();
+    }
+
+    init() {
+      const gl = this.gl;
+      try {
+        this.copy = program(gl, COPY_FS);
+        this.blur = program(gl, BLUR_FS);
+        this.glass = program(gl, GLASS_FS);
+      } catch (e) {
+        console.error('Glass shaders failed; using plain surfaces.', e);
+        this.ok = false;
+        return;
+      }
+      this.screen = texture(gl);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+      gl.bindVertexArray(gl.createVertexArray());
+      this.a = this.b = null;
+      this.has = 0;
+      this.pending = null;
+      this.blurred = null;
+      this.fresh = !!this.video;
+      this.ok = true;
     }
 
     resize(cssW, cssH, dpr) {
-      const gl = this.gl;
       this.cssW = cssW; this.cssH = cssH; this.dpr = dpr;
+      if (!this.ok) return;
+      const gl = this.gl;
       this.canvas.width = Math.round(cssW * dpr);
       this.canvas.height = Math.round(cssH * dpr);
       for (const t of [this.a, this.b]) if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); }
       const bw = Math.ceil(cssW / 2), bh = Math.ceil(cssH / 2);
       this.a = target(gl, bw, bh);
       this.b = target(gl, bw, bh);
+      this.blurred = null;
     }
 
     // window-local css px -> screen texture uv
     setGeometry({ win, display }) {
       this.map = [(win.x - display.x) / display.width, (win.y - display.y) / display.height, 1 / display.width, 1 / display.height];
+      this.blurred = null;
     }
 
+    // Each call replaces the previous video's frame callback chain.
     attachVideo(video) {
       this.video = video;
+      const token = (this.videoToken = (this.videoToken || 0) + 1);
       const onFrame = () => {
+        if (token !== this.videoToken) return;
         this.fresh = true;
+        this.lastFrameAt = performance.now();
         if (this.onFrame) this.onFrame();
         video.requestVideoFrameCallback(onFrame);
       };
       video.requestVideoFrameCallback(onFrame);
     }
 
-    pass(prog, dest) {
+    detachVideo() {
+      this.videoToken = (this.videoToken || 0) + 1;
+      this.video = null;
+      this.fresh = false;
+    }
+
+    // css px box -> scissor rect in a target of `scale` px per css px (y flipped, clamped)
+    scissor(box, scale, w, h) {
+      const x0 = Math.max(0, Math.floor(box.x0 * scale)), x1 = Math.min(w, Math.ceil(box.x1 * scale));
+      const y0 = Math.max(0, Math.floor((this.cssH - box.y1) * scale)), y1 = Math.min(h, Math.ceil((this.cssH - box.y0) * scale));
+      this.gl.scissor(x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0));
+    }
+
+    pass(prog, dest, box) {
       const gl = this.gl;
       gl.bindFramebuffer(gl.FRAMEBUFFER, dest ? dest.fb : null);
-      gl.viewport(0, 0, dest ? dest.w : this.canvas.width, dest ? dest.h : this.canvas.height);
+      const w = dest ? dest.w : this.canvas.width, h = dest ? dest.h : this.canvas.height;
+      gl.viewport(0, 0, w, h);
+      this.scissor(box, dest ? 0.5 : this.dpr, w, h);
       gl.useProgram(prog.p);
     }
 
     // shapes: [dock, popover, panel], each null or
-    // { rect:{x,y,w,h}, radius, exp, merge, theme, frost, shadow, tint }
+    // { rect:{x,y,w,h}, radius, exp, merge, theme, frost, shadow, tint, sample? }, where sample is
+    // the rect whose backdrop sets the appearance (where a growing surface will end up)
     render(shapes, wallX) {
+      if (!this.ok || !this.a) return;
       const gl = this.gl;
+      if (gl.isContextLost()) return;
+      const union = (b, r) => (b ? { x0: Math.min(b.x0, r.x), y0: Math.min(b.y0, r.y), x1: Math.max(b.x1, r.x + r.w), y1: Math.max(b.y1, r.y + r.h) }
+        : { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.h });
+      let box = null, sampled = null; // drawn area; area read for blur and brightness
+      for (const s of shapes) {
+        if (!s) continue;
+        box = union(box, s.rect);
+        sampled = union(union(sampled, s.rect), s.sample || s.rect);
+      }
+      if (!box) return;
+
+      let newFrame = false;
       if (this.fresh && this.video && this.video.readyState >= 2) {
         gl.bindTexture(gl.TEXTURE_2D, this.screen);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
         this.has = 1;
         this.fresh = false;
+        newFrame = true;
       }
 
-      // 1-2: backdrop copy + frosted blur (a -> b -> a, four widening iterations)
-      this.pass(this.copy, this.a);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.screen);
-      gl.uniform1i(this.copy.u.uScreen, 0);
-      gl.uniform4fv(this.copy.u.uMap, this.map);
-      gl.uniform2f(this.copy.u.uCss, this.cssW, this.cssH);
-      gl.uniform1f(this.copy.u.uHas, this.has);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      // moderate blur: shapes and colour behind stay visible, text behind does not
-      for (const step of [1, 2, 3, 4]) {
-        this.pass(this.blur, this.b);
-        gl.bindTexture(gl.TEXTURE_2D, this.a.tex);
-        gl.uniform1i(this.blur.u.uSrc, 0);
-        gl.uniform2f(this.blur.u.uDir, step / this.a.w, 0);
+      gl.enable(gl.SCISSOR_TEST);
+      // 1-2: backdrop copy + frosted blur (a -> b -> a, four widening iterations). The blur
+      // reaches about 64 css px in total, so copying 72 px beyond the needed area keeps it exact.
+      const need = grow(sampled, 24);
+      if (newFrame || !contains(this.blurred, need)) {
+        const area = grow(need, 40); // slack, so a growing surface does not redo this every frame
+        const copyBox = grow(area, 72);
+        this.pass(this.copy, this.a, copyBox);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.screen);
+        gl.uniform1i(this.copy.u.uScreen, 0);
+        gl.uniform4fv(this.copy.u.uMap, this.map);
+        gl.uniform2f(this.copy.u.uCss, this.cssW, this.cssH);
+        gl.uniform1f(this.copy.u.uHas, this.has);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
-        this.pass(this.blur, this.a);
-        gl.bindTexture(gl.TEXTURE_2D, this.b.tex);
-        gl.uniform2f(this.blur.u.uDir, 0, step / this.a.h);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        // moderate blur: shapes and colour behind stay visible, text behind does not
+        for (const step of [1, 2, 3, 4]) {
+          this.pass(this.blur, this.b, copyBox);
+          gl.bindTexture(gl.TEXTURE_2D, this.a.tex);
+          gl.uniform1i(this.blur.u.uSrc, 0);
+          gl.uniform2f(this.blur.u.uDir, step / this.a.w, 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          this.pass(this.blur, this.a, copyBox);
+          gl.bindTexture(gl.TEXTURE_2D, this.b.tex);
+          gl.uniform2f(this.blur.u.uDir, 0, step / this.a.h);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        }
+        this.blurred = area;
       }
       this.sampleLuma(shapes);
 
-      // 3: glass
+      // 3: glass, cleared everywhere, drawn only around the surfaces (shadow reaches 48 px)
       const rect = new Float32Array(12), shape = new Float32Array(12), look = new Float32Array(12);
       shapes.forEach((s, i) => {
         if (!s) return;
@@ -290,7 +379,12 @@ void main() {
         shape.set([s.radius, s.exp, 1, s.merge], i * 4);
         look.set([s.theme, s.frost, s.shadow, s.tint], i * 4);
       });
-      this.pass(this.glass, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.enable(gl.SCISSOR_TEST);
+      this.pass(this.glass, null, grow(box, 52));
       const u = this.glass.u;
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.screen);
@@ -308,26 +402,61 @@ void main() {
       gl.uniform4fv(u.uLook, look);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       gl.activeTexture(gl.TEXTURE0);
+      gl.disable(gl.SCISSOR_TEST);
     }
 
-    // Average backdrop luminance under each surface (0..1), sampled from the blurred buffer
-    // a few times a second; drives the light/dark appearance of each surface.
+    sampleSoon() { this.lumaAt = 0; }
+
+    // Average backdrop luminance under each surface (0..1), sampled from the blurred buffer a few
+    // times a second; drives the light/dark appearance of each surface. The read goes into a
+    // pixel buffer and is collected on a later frame once the GPU is done, so it never stalls the
+    // page waiting on a busy GPU (a plain readPixels did, and froze clicks under load).
     sampleLuma(shapes) {
-      const now = performance.now();
-      if (now - this.lumaAt < 300 || !this.has) return;
+      const gl = this.gl, now = performance.now();
+      if (this.pending) {
+        const status = gl.getSyncParameter(this.pending.sync, gl.SYNC_STATUS);
+        if (status !== gl.SIGNALED) {
+          if (now - this.pending.at < 2000) return;
+          gl.deleteSync(this.pending.sync); // lost fence: give up on this sample
+          gl.deleteBuffer(this.pending.pbo);
+          this.pending = null;
+        } else {
+          const px = new Uint8Array(64 * 3);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.pending.pbo);
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, px);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+          gl.deleteSync(this.pending.sync);
+          gl.deleteBuffer(this.pending.pbo);
+          for (const i of this.pending.which) {
+            let sum = 0;
+            for (let k = i * 64; k < i * 64 + 64; k += 4) sum += 0.2126 * px[k] + 0.7152 * px[k + 1] + 0.0722 * px[k + 2];
+            this.luma[i] = sum / 16 / 255;
+            this.lumaGen[i]++;
+          }
+          this.pending = null;
+        }
+      }
+      if (now - this.lumaAt < LUMA_EVERY || !this.has) return;
       this.lumaAt = now;
-      const gl = this.gl, px = new Uint8Array(4 * 16);
+      const which = [];
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.a.fb);
+      // a fresh buffer per sample: reusing one makes Chromium drop its fast readback copy
+      const pbo = gl.createBuffer();
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, 64 * 3, gl.STREAM_READ);
       shapes.forEach((s, i) => {
         if (!s) return;
-        const cx = Math.round((s.rect.x + Math.min(s.rect.w, 120) / 2) / 2);
-        const cy = Math.round((this.cssH - (s.rect.y + s.rect.h / 2)) / 2);
+        const r = s.sample || s.rect;
+        const cx = Math.round((r.x + Math.min(r.w, 120) / 2) / 2);
+        const cy = Math.round((this.cssH - (r.y + r.h / 2)) / 2);
         const x = Math.max(0, Math.min(this.a.w - 4, cx - 2)), y = Math.max(0, Math.min(this.a.h - 4, cy - 2));
-        gl.readPixels(x, y, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, px);
-        let sum = 0;
-        for (let k = 0; k < 64; k += 4) sum += 0.2126 * px[k] + 0.7152 * px[k + 1] + 0.0722 * px[k + 2];
-        this.luma[i] = sum / 16 / 255;
+        gl.readPixels(x, y, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, i * 64);
+        which.push(i);
       });
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      if (!which.length) { gl.deleteBuffer(pbo); return; }
+      this.pending = { sync: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), pbo, which, at: now };
+      gl.flush();
     }
   }
 
